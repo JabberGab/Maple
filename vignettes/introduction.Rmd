@@ -1,0 +1,371 @@
+---
+title: "Introduction to Maple"
+author: "Gabriele Dolfi"
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+vignette: >
+  %\VignetteIndexEntry{Introduction to Maple}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  fig.width  = 6,
+  fig.height = 4
+)
+```
+
+# Introduction
+
+Single-cell RNA sequencing data contains biological structure at multiple
+levels of resolution — broad cell types, finer subtypes, and rare populations.
+Standard clustering methods require the user to pick a single resolution
+parameter, which forces a global choice between coarse and fine granularity.
+This choice is arbitrary and necessarily suboptimal: the resolution that best
+captures T cell subtypes may over-fragment monocytes, and vice versa.
+
+**Maple** (Multi-resolution Automated Partitioning via Leiden Ensemble)
+addresses this by running Leiden clustering across a resolution grid,
+measuring the stability of each partition via repeated subsampling, and
+pruning the resulting hierarchy to find the locally optimal resolution for
+each cell population. The result is a single partition where different
+populations are resolved at the granularity that the data supports,
+some at coarse resolution, others at fine resolution. 
+
+The key properties of Maple are:
+
+- **Multi-resolution**: each cell population is resolved at its natural
+  granularity, not a globally imposed one;
+- **Stability-driven**: only clusters that are reproducible across subsamples
+  are retained;
+- **Interpretable**: the partition tree and per-cell path stability scores
+  make the clustering decisions transparent;
+- **Fast**: the global KNN index is built once and reused across all
+  subsampling iterations, making Maple faster than comparable methods.
+
+<!-- # Installation -->
+
+
+<!-- # Install from GitHub -->
+<!-- remotes::install_github("yourusername/Maple") -->
+
+# Data preparation
+
+We use the 3k PBMC dataset from 10x Genomics, available via
+`TENxPBMCData`. This is a well-characterised dataset with known cell
+type structure, making it ideal for demonstrating Maple's behaviour.
+
+```{r load-packages, message = FALSE, warning = FALSE}
+library(Maple)
+library(TENxPBMCData)
+library(scuttle)
+library(scater)
+library(BiocParallel)
+library(igraph)
+library(BiocNeighbors)
+library(bluster)
+```
+
+```{r load-data, message = FALSE}
+sce <- TENxPBMCData("pbmc3k")
+sce
+```
+
+## Quality control and normalisation
+
+```{r qc, message = FALSE}
+# Per-cell QC metrics
+sce <- addPerCellQCMetrics(sce)
+
+# Filter low-quality cells
+qc_filters <- quickPerCellQC(colData(sce))
+sce <- sce[, !qc_filters$discard]
+
+# Normalisation
+sce <- logNormCounts(sce)
+
+cat("Cells after QC:", ncol(sce), "\n")
+```
+
+## Feature selection and dimensionality reduction
+
+```{r pca, message = FALSE}
+# Highly variable genes
+dec <- scran::modelGeneVar(sce)
+hvgs <- scran::getTopHVGs(dec, n = 2000)
+
+# PCA on HVGs
+set.seed(42)
+sce <- runPCA(sce, subset_row = hvgs, ncomponents = 30)
+
+## Leiden clustering used as reference later
+
+X   <- reducedDim(sce, "PCA")[, 1:30]
+nn  <- BiocNeighbors::findKNN(X, k = 25,
+                               BNPARAM      = BiocNeighbors::AnnoyParam(),
+                               get.distance = FALSE)$index
+graph <- bluster::neighborsToSNNGraph(nn, type = "jaccard")
+set.seed(42)
+sce$leiden_0.5 <- igraph::cluster_leiden(graph,
+                                          resolution         = 0.5,
+                                          objective_function = "modularity")$membership
+sce$leiden_1.0 <- igraph::cluster_leiden(graph,
+                                          resolution         = 1.0,
+                                          objective_function = "modularity")$membership
+```
+
+# SCE workflow
+
+The SCE workflow uses `Maple()`, `grow_Maple()` and `cut_Maple()` directly
+on the `SingleCellExperiment` object. Results are stored in
+`metadata(sce)$Maple` and `colData(sce)` at each step.
+
+## Step 1 — Compute stability scores
+
+`Maple()` runs Leiden clustering across the resolution grid on the full
+dataset to obtain reference partitions, then estimates per-cell stability
+scores via repeated subsampling. This is the most computationally expensive
+step — it runs `nrep = 25` subsampling iterations, each involving Leiden
+clustering at every resolution in `grid`. The BPPARAM can be set according to the operating system to parallelize the calculation.
+
+```{r maple-sce, message = TRUE}
+set.seed(313)
+sce <- Maple(
+  x               = sce,
+  dimred          = "PCA",
+  dims            = 30,
+  grid            = seq(0.1, 2, by = 0.1),
+  nrep            = 25,
+  split_prop      = 0.8,
+  k               = 25,
+  k_max           = 50,
+  prune_threshold = 1/15,
+  BPPARAM         = BiocParallel::SerialParam(RNGseed = 42)
+)
+```
+
+The results are stored in `metadata(sce)$Maple`:
+
+```{r maple-sce-inspect}
+names(metadata(sce)$Maple)
+dim(metadata(sce)$Maple$scores)
+```
+
+## Step 2 — Inspect diagnostics
+
+Before building the tree, use `plotDiagnostics()` to inspect the stability
+distributions and choose appropriate parameters for `grow_Maple()` and
+`cut_Maple()`.
+
+The left panel shows:
+
+- **In Proportion**: the proportion of a child cluster's cells that come
+  from a single parent. Use this to choose `in_prop_threshold` — values
+  below the bulk of the distribution represent spurious cross-resolution
+  connections.
+- **Obs Stability**: the per-cell Jaccard stability scores across all
+  resolutions. Use this to choose `stability_threshold` — the dashed line
+  in the right panel shows the adaptive threshold obtained as the median stability   level.
+
+The right panel shows the minimum node stability per resolution. Resolutions
+where this drops below the adaptive threshold (dashed red line) tend to
+produce unreliable clusters.
+
+```{r diagnostics, fig.width = 10, fig.height = 5}
+plotDiagnostics(sce)
+```
+
+## Step 3 — Build the tree
+
+`grow_Maple()` constructs the partition tree from the stability scores.
+`in_prop_threshold` controls how strict the parent-child connections are,
+and `qlevel` controls the quantile used to assign stability to each node.
+
+```{r grow-sce, message = TRUE}
+sce <- grow_Maple(
+  x                 = sce,
+  in_prop_threshold = 0.1,
+  qlevel            = 0.2
+)
+```
+
+Visualise the tree with `plotTree()`. Nodes are sized by cluster size and
+coloured by stability score (red = unstable, green = stable). The grey
+node at the root is the virtual root at resolution 0, which serves as a
+guaranteed fallback for all cells.
+
+```{r plot-tree, fig.width = 10, fig.height = 7}
+plotTree(sce)
+```
+
+## Step 4 — Prune the tree
+
+`cut_Maple()` traverses the tree via depth-first search to find the optimal
+frontier of valid nodes. A node is valid if its stability score meets
+`stability_threshold` and its size meets `min_size`. Use `plotDiagnostics()`
+to inform these choices, or pass `stability_threshold = "adaptive"` to use
+the median stability score as the threshold.
+
+```{r cut-sce, message = TRUE}
+sce <- cut_Maple(
+  x                   = sce,
+  stability_threshold = 0.8,
+  min_size            = 50
+)
+```
+
+Visualise the pruning with `plotPruning()`. Dark red nodes are the optimal
+frontier clusters, lighter red nodes are on the path to the frontier, and
+grey nodes were not selected.
+
+```{r plot-pruning, fig.width = 10, fig.height = 7}
+plotPruning(sce)
+```
+
+The cluster labels and per-cell path stability scores are stored in
+`colData(sce)`:
+
+```{r labels}
+table(sce$Maple_labels)
+summary(sce$Maple_path_stability)
+```
+
+## Exploring different prunings
+
+A key advantage of the three-step design is that `cut_Maple()` can be
+rerun with different parameters without rerunning the expensive `Maple()`
+step. The original tree is always preserved in `metadata(sce)$Maple$tree`.
+
+```{r rerun-cut, message = TRUE}
+# More conservative pruning
+sce <- cut_Maple(
+  x                   = sce,
+  stability_threshold = "adaptive",
+  min_size            = 100
+)
+
+table(sce$Maple_labels)
+```
+
+## Visualising clusters on UMAP
+
+```{r umap, message = FALSE}
+set.seed(42)
+sce <- runUMAP(sce, dimred = "PCA", n_dimred = 30)
+
+plotUMAP(sce, colour_by = "Maple_labels", point_size = 0.5)
+```
+
+## Using a pre-computed reference
+
+If you have already run a clustering (e.g. with Seurat or scran) and want
+to assess its stability, pass the `colData` column names as `reference`.
+The grid should match the resolutions at which those clusterings were
+obtained; reference and grid must be given in the same order and are internally sorted for increasing resolution. Note that when providing a pre-computed reference, one should ensure it was obtained with k and prune_threshold matching the values passed to `Maple()`. The stability calculation assume the reference was obtained using a Leiden algorithm with modularity loss function. 
+
+```{r reference-sce, eval = TRUE}
+# Assuming colData(sce) has columns "leiden_0.5" and "leiden_1.0"
+set.seed(313)
+sce <- Maple(
+  x         = sce,
+  dimred    = "PCA",
+  dims      = 30,
+  grid      = c(0.5, 1.0),
+  reference = c("leiden_0.5", "leiden_1.0"),
+  BPPARAM   = BiocParallel::SerialParam(RNGseed = 42),
+  add_scores = TRUE,
+  k          = 25,
+  k_max      = 50,
+  prune_threshold = 0
+)
+```
+
+You can then check the stability for the chosen resolution (e.g. "leiden_1.0") simply plotting by `plotUMAP`. 
+
+```{r reference-stability, eval = TRUE}
+plotUMAP(sce, colour_by = "Maple_stability_R1")
+```
+
+# Matrix workflow
+
+For users who do not work with `SingleCellExperiment` objects, Maple
+accepts a plain numeric matrix of reduced dimensions and returns a
+`MapleResult` object. The API is identical.
+
+```{r matrix-workflow, message = TRUE}
+# Extract PCA embedding as plain matrix
+set.seed(313)
+result <- Maple(
+  x               = X,
+  grid            = seq(0.1, 2, by = 0.1),
+  nrep            = 25,
+  split_prop      = 0.8,
+  k               = 25,
+  k_max           = 50,
+  prune_threshold = 1/15,
+  BPPARAM         = BiocParallel::SerialParam(RNGseed = 42)
+)
+
+result
+```
+
+```{r matrix-grow, message = TRUE}
+result <- grow_Maple(
+  x                 = result,
+  in_prop_threshold = 0.1,
+  qlevel            = 0.2
+)
+```
+
+```{r matrix-cut, message = TRUE}
+result <- cut_Maple(
+  x                   = result,
+  stability_threshold = 0.8,
+  min_size            = 50
+)
+
+table(result$labels)
+```
+
+Plot functions accept `MapleResult` objects directly:
+
+```{r matrix-plots, fig.width = 10, fig.height = 7}
+plotDiagnostics(result)
+plotTree(result)
+plotPruning(result)
+```
+
+## Using a pre-computed reference with the matrix workflow
+
+Pass a named list of integer vectors, one per resolution in `grid`:
+
+```{r matrix-reference, eval = TRUE}
+# Assuming you have pre-computed clusterings as integer vectors
+reference <- list(
+  "0.5" = as.integer(sce$leiden_0.5),
+  "1.0" = as.integer(sce$leiden_1.0)
+)
+
+result <- Maple(
+  x         = X,
+  grid      = c(0.5, 1.0),
+  reference = reference,
+  BPPARAM   = BiocParallel::SerialParam(RNGseed = 42),
+  k               = 25,
+  k_max           = 50,
+  prune_threshold = 0
+)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

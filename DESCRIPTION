@@ -1,0 +1,43 @@
+Package: Maple
+Title: Multi-resolution Automated Partitioning via Leiden Exploration
+Version: 0.1.0
+Authors@R: person("Gabriele", "Dolfi",
+    email = "gabriele.dolfi@phd.unipd.it",
+    role = c("aut", "cre"),
+    comment = c(ORCID = "0009-0005-1337-3468"))
+Description: Maple identifies a multi-resolution clustering of single cells
+    by building a stability-weighted partition tree across a Leiden resolution
+    grid and pruning it to find the optimal simultaneous partition at multiple
+    granularity levels.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+biocViews: SingleCell, Clustering, Software
+Depends:
+    R (>= 4.3.0)
+Imports:
+    BiocNeighbors,
+    BiocParallel,
+    bluster,
+    igraph,
+    collapse,
+    Matrix,
+    matrixStats,
+    ggplot2,
+    ggraph,
+    patchwork,
+    S4Vectors,
+    SummarizedExperiment,
+    SingleCellExperiment,
+    methods
+Suggests:
+    TENxPBMCData,
+    scuttle,
+    scater,
+    scran,
+    BiocStyle,
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+VignetteBuilder: knitr
+Config/roxygen2/version: 8.1.1
