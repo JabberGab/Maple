@@ -1,0 +1,36 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  out.width = "100%"
+)
+```
+
+# Maple
+
+<!-- badges: start -->
+ [![R-CMD-check](https://github.com/JabberGab/Maple/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/JabberGab/Maple/actions/workflows/R-CMD-check.yaml)
+<!-- badges: end -->
+
+## Installation
+
+```{r}
+remotes::install_github("JabberGab/Maple")
+```
+
+## Quick start
+
+```{r, eval = FALSE}
+library(Maple)
+sce <- Maple(sce, dimred = "PCA", dims = 30, grid = seq(0.1, 2, by = 0.1))
+sce <- grow_Maple(sce)
+sce <- cut_Maple(sce)
+```
+
