@@ -90,7 +90,7 @@ calculate_stability <- function(X,
     ref_graph  <- .create_graph(nn_global[, 1:k], prune_threshold)
     ref_labels <- BiocParallel::bplapply(grid, function(r) {
       igraph::cluster_leiden(ref_graph,
-                             resolution         = r,
+                             resolution = r,
                              objective_function = "modularity")$membership
     }, BPPARAM = BPPARAM)
     names(ref_labels) <- as.character(grid)
